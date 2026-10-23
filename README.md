@@ -1,0 +1,79 @@
+# pydantic-ai-glen
+
+A [Pydantic AI](https://ai.pydantic.dev/) capability that connects an agent to
+[Glen](https://tryglen.com), a shared team memory. It does two things:
+
+- **Search**: adds a `glen_search` tool so the agent can ask Glen a question.
+- **Recording**: after every run, sends that run's conversation to Glen so it becomes
+  searchable memory. Glen extracts memory in the background on its side.
+
+## Setup
+
+1. Create an API key at https://app.tryglen.com/settings/api-keys.
+2. In Glen, switch to the organization the agent should use, click **Connect an agent**,
+   then **MCP server**, and copy the value next to `x-glen-org-id`.
+3. Set both where the app runs (never commit them):
+
+```
+GLEN_API_KEY=<your key>
+GLEN_ORG_ID=<your organization id>
+```
+
+`GLEN_URL` is optional and defaults to `https://app.tryglen.com`.
+
+## Usage
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai_glen import Glen
+
+glen = Glen()  # reads GLEN_API_KEY / GLEN_ORG_ID
+agent = Agent("openai:gpt-5", capabilities=[glen])
+
+result = await agent.run("why does the billing worker batch at 500?")
+await glen.flush()  # before a short-lived process exits
+```
+
+Recording hooks into `after_run`, so `run`, `run_stream`, `iter` and `run_sync` are all
+covered with no wrapper code.
+
+| Option | Default | |
+| --- | --- | --- |
+| `api_key`, `org_id`, `url` | env vars | Constructor values win over the environment |
+| `search` | `True` | Expose the `glen_search` tool |
+| `record` | `True` | Send finished runs to Glen |
+| `background` | `True` | Upload without delaying the run. Use `False` with `run_sync` |
+| `agent_name`, `agent_version` | `"pydantic-ai"`, `None` | Reported to Glen |
+| `workspace` | `None` | `cwd`, `repoName`, `branch`, `commit`, `remoteUrl` |
+
+Conversations are grouped by Pydantic AI's `conversation_id`. Pass your own thread id to
+`agent.run(..., conversation_id=...)` to keep one Glen conversation across runs.
+
+### Behavior
+
+- A Glen failure never fails a run. Search returns a short message to the model; recording
+  retries transient errors (429/5xx) three times with the same idempotency key, then logs.
+- Only this run's new messages are sent, with tool calls, tool results and thinking as
+  ordered segments. System prompts and non-text prompt content (images, audio) are not sent.
+- Everything recorded becomes real team memory. Don't point test runs at your real org.
+
+### Known issue
+
+Conversations recorded this way currently show up in Glen labelled as Claude Code sessions
+(`claude-code:<conversationId>`). Only the label is affected; recording, search and memory
+work normally.
+
+## Development
+
+```bash
+uv sync --extra dev
+uv run ruff check . && uv run ruff format --check .
+uv run pytest
+```
+
+Tests fake Glen's HTTP API with `httpx.MockTransport`; the agent, capability and message
+conversion run for real.
+
+## License
+
+MIT
