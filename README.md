@@ -63,6 +63,19 @@ Conversations recorded this way currently show up in Glen labelled as Claude Cod
 (`claude-code:<conversationId>`). Only the label is affected; recording, search and memory
 work normally.
 
+## Try it
+
+`examples/demo.py` is an interactive chat that searches Glen and records the conversation:
+
+```bash
+export GLEN_API_KEY=... GLEN_ORG_ID=...
+uv run --with "pydantic-ai-slim[anthropic]" python examples/demo.py --model anthropic:claude-sonnet-5-5
+uv run --with "pydantic-ai-slim[anthropic]" python examples/demo.py --model anthropic:claude-sonnet-5-5 --search-only
+```
+
+It asks before recording, since whatever you type becomes team memory. Use any model string
+Pydantic AI supports (`--model` or `DEMO_MODEL`).
+
 ## Development
 
 ```bash
