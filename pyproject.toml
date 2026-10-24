@@ -9,7 +9,7 @@ description = "Pydantic AI capability that connects an agent to Glen's shared te
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
-authors = [{ name = "Scale Venture Partners", email = "will@scalevp.com" }]
+authors = [{ name = "Scale Venture Partners" }]
 keywords = ["pydantic-ai", "capability", "agents", "memory", "glen"]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -19,6 +19,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
   "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
@@ -26,12 +27,19 @@ dependencies = [
   "httpx>=0.27.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/scale-venture-partners/pydantic-ai-glen"
+Issues = "https://github.com/scale-venture-partners/pydantic-ai-glen/issues"
+
 [project.optional-dependencies]
 dev = [
   "pytest>=7.4",
   "pytest-asyncio>=0.23",
   "ruff>=0.3.7,<0.17",
 ]
+
+[tool.setuptools.package-data]
+pydantic_ai_glen = ["py.typed"]
 
 [tool.setuptools.packages.find]
 where = ["."]

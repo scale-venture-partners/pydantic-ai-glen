@@ -87,6 +87,10 @@ uv run pytest
 Tests fake Glen's HTTP API with `httpx.MockTransport`; the agent, capability and message
 conversion run for real.
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+
+This is an independent integration; Pydantic AI and Glen are their respective owners' projects.
+
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE).
