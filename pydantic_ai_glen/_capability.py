@@ -11,8 +11,10 @@ from typing import Any
 
 import httpx
 from pydantic_ai import RunContext
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities import AbstractCapability, WrapRunHandler
 from pydantic_ai.exceptions import UserError
+from pydantic_ai.messages import ModelMessage
+from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.run import AgentRunResult
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
@@ -42,7 +44,8 @@ _INSTRUCTIONS = (
 class Glen(AbstractCapability[AgentDepsT]):
     """Connect an agent to Glen's shared team memory.
 
-    Adds a `glen_search` tool and records every run to Glen once it finishes. Recording
+    Adds a `glen_search` tool and records every run to Glen once it ends. A run that fails or is
+    cancelled is recorded too (what it did so far), and its error still raises. Recording
     runs in the background; call `await glen.flush()` before a short-lived process exits.
     Under `run_sync` the event loop closes with the run, so set `background=False`.
     """
@@ -83,6 +86,8 @@ class Glen(AbstractCapability[AgentDepsT]):
 
     _client: httpx.AsyncClient | None = field(default=None, init=False, repr=False)
     _pending: set[asyncio.Task[None]] = field(default_factory=set, init=False, repr=False)
+    _history_len: dict[str, int] = field(default_factory=dict, init=False, repr=False)
+    _latest: dict[str, list[ModelMessage]] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.api_key = self.api_key or os.environ.get("GLEN_API_KEY")
@@ -153,36 +158,90 @@ class Glen(AbstractCapability[AgentDepsT]):
         suffix = "\n\nCould not verify:\n- " + "\n- ".join(gaps) if gaps else ""
         return data["answer"] + suffix
 
+    async def before_run(self, ctx: RunContext[AgentDepsT]) -> None:
+        # Where this run's own messages start. The run-level context does not follow the run,
+        # so a run that ends before it has a result is rebuilt from the last model request.
+        self._history_len[ctx.run_id] = len(ctx.messages)
+
+    async def before_model_request(
+        self, ctx: RunContext[AgentDepsT], request_context: ModelRequestContext
+    ) -> ModelRequestContext:
+        self._latest[ctx.run_id] = list(ctx.messages)
+        return request_context
+
+    async def wrap_run(
+        self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler
+    ) -> AgentRunResult[Any]:
+        """Record what a failed or cancelled run did, then let the error through unchanged.
+
+        Done here rather than in `on_run_error`, which older pydantic-ai versions call after
+        `wrap_run` has already seen the error."""
+        try:
+            return await handler()
+        except BaseException as error:
+            await self._record_unfinished(ctx, error)
+            raise
+        finally:
+            self._history_len.pop(ctx.run_id, None)
+            self._latest.pop(ctx.run_id, None)
+
     async def after_run(
         self, ctx: RunContext[AgentDepsT], *, result: AgentRunResult[Any]
     ) -> AgentRunResult[Any]:
+        await self._record(
+            result.conversation_id, result.run_id, result.new_messages(), result.output
+        )
+        return result
+
+    async def _record_unfinished(self, ctx: RunContext[AgentDepsT], error: BaseException) -> None:
+        messages = self._latest.get(ctx.run_id, [])[self._history_len.get(ctx.run_id, 0) :]
+        if not messages:
+            return
+        if isinstance(error, asyncio.CancelledError):
+            note = "[The run was cancelled before it finished.]"
+        else:
+            note = f"[The run failed: {type(error).__name__}: {str(error)[:300]}]"
+        await self._record(ctx.conversation_id, ctx.run_id, messages, note)
+
+    async def _record(
+        self,
+        conversation_id: str | None,
+        run_id: str,
+        messages: list[ModelMessage],
+        output: Any,
+    ) -> None:
         if not self.record:
-            return result
+            return
         try:
-            body = self._turn_body(result)
+            body = self._turn_body(conversation_id, run_id, messages, output)
         except Exception:
             log.exception("glen could not build the turn payload")
-            return result
+            return
         if self.background:
             task = asyncio.create_task(self._send_turn(body))
             self._pending.add(task)
             task.add_done_callback(self._pending.discard)
         else:
             await self._send_turn(body)
-        return result
 
-    def _turn_body(self, result: AgentRunResult[Any]) -> dict[str, Any]:
+    def _turn_body(
+        self,
+        conversation_id: str | None,
+        run_id: str,
+        messages: list[ModelMessage],
+        output: Any,
+    ) -> dict[str, Any]:
         agent: dict[str, str] = {"name": self.agent_name}
         if self.agent_version:
             agent["version"] = self.agent_version
         context: dict[str, Any] = {"agent": agent}
         if self.workspace:
             context["workspace"] = self.workspace
-        key = f"{result.conversation_id}\0{result.run_id}"
+        key = f"{conversation_id}\0{run_id}"
         return {
-            "conversationId": result.conversation_id,
+            "conversationId": conversation_id,
             "idempotencyKey": hashlib.sha256(key.encode()).hexdigest(),
-            "messages": to_glen_messages(result.new_messages(), result.output),
+            "messages": to_glen_messages(messages, output),
             "additionalContext": context,
         }
 
