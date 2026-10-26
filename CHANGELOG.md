@@ -6,6 +6,7 @@
 - A run that fails or is cancelled is now recorded (what it did so far), where before only finished runs were. Its error still raises. A background-agent deadline is a cancellation, so those runs are no longer lost.
 - `workspace` defaults to `"auto"`: each recorded turn carries the repo, branch, commit and remote read from git in the current directory, as the Claude Code plugin sends them, so Glen can tie a conversation to a repo and its PRs. Pass `workspace=None` to send none, or a dict to set your own. The remote is sent as `https://host/owner/repo` with credentials dropped.
 - The capability follows the account's Glen mode, as the Claude Code plugin does: `off` uses and records nothing, `silent` records but hides the tool and instructions, `incognito` keeps the tool but records nothing. The mode is read from Glen's control status about once a minute and updated from each turn response; if Glen cannot be reached the agent runs as `on`. `modes=False` turns this off. A paused recording (plan limit) and a rejected key (401, 402, 403, 426) are now reported once through `on_notice` as well as logged.
+- `glen_code_search(path, start_line, question, end_line=None)`: a tool that traces lines of code to the agent conversations that wrote them, like `glen code-search` in the CLI. It blames the lines, reads each commit's `Glen-Conversation` trailer and asks Glen. It is offered only in a git checkout with a remote (and not in `off` or `silent` mode); `code_search=False` removes it.
 
 ## 0.1.0
 
