@@ -7,6 +7,14 @@ A [Pydantic AI](https://ai.pydantic.dev/) capability that connects an agent to
 - **Recording**: after every run, sends that run's conversation to Glen so it becomes
   searchable memory. Glen extracts memory in the background on its side.
 
+## Install
+
+```bash
+pip install pydantic-ai-glen
+```
+
+Requires Python 3.10+ and `pydantic-ai-slim>=2.9`.
+
 ## Setup
 
 1. Create an API key at https://app.tryglen.com/settings/api-keys.
