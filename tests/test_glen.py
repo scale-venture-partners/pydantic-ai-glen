@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -271,3 +272,77 @@ async def test_instructions_follow_the_search_tool_and_can_be_turned_off() -> No
         glen = make_glen(FakeGlen(), **kwargs)
         await Agent(capturing_model(seen), capabilities=[glen]).run("fix billing")
         assert not seen[0] or "glen_search" not in seen[0]
+
+
+def tool_then_fail() -> FunctionModel:
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(parts=[ToolCallPart("glen_search", {"query": "q"})])
+        raise RuntimeError("model fell over")
+
+    return FunctionModel(respond)
+
+
+async def test_a_failed_run_is_recorded_and_the_error_still_raises() -> None:
+    fake = FakeGlen()
+    glen = make_glen(fake)
+    agent = Agent(tool_then_fail(), capabilities=[glen])
+
+    with pytest.raises(RuntimeError, match="model fell over"):
+        await agent.run("investigate billing")
+    await glen.flush()
+
+    [body] = fake.bodies("/api/mcp/route/turn")
+    user, assistant = body["messages"]
+    assert user["content"] == "investigate billing"
+    assert "RuntimeError: model fell over" in assistant["content"]
+    assert [s["kind"] for s in assistant["segments"]] == ["tool_call", "tool_result"]
+
+
+async def test_a_failed_run_records_only_its_own_messages() -> None:
+    fake = FakeGlen()
+    glen = make_glen(fake)
+    first = Agent(text_model("earlier answer"), capabilities=[glen])
+    history = (await first.run("an earlier question")).all_messages()
+    await glen.flush()
+    fake.requests.clear()
+
+    with pytest.raises(RuntimeError):
+        await Agent(tool_then_fail(), capabilities=[glen]).run(
+            "the new question", message_history=history
+        )
+    await glen.flush()
+
+    [body] = fake.bodies("/api/mcp/route/turn")
+    assert [m["content"] for m in body["messages"] if m["role"] == "user"] == ["the new question"]
+
+
+async def test_a_cancelled_run_is_recorded_and_stays_cancelled() -> None:
+    fake = FakeGlen()
+    glen = make_glen(fake)
+    started = asyncio.Event()
+
+    async def hang(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        started.set()
+        await asyncio.sleep(60)
+        raise AssertionError("not reached")
+
+    task = asyncio.create_task(Agent(FunctionModel(hang), capabilities=[glen]).run("a long job"))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await glen.flush()
+
+    [body] = fake.bodies("/api/mcp/route/turn")
+    assert body["messages"][0]["content"] == "a long job"
+    assert "cancelled" in body["messages"][-1]["content"]
+
+
+async def test_a_failed_run_is_not_recorded_when_record_is_off() -> None:
+    fake = FakeGlen()
+    glen = make_glen(fake, record=False)
+    with pytest.raises(RuntimeError):
+        await Agent(tool_then_fail(), capabilities=[glen]).run("x")
+    await glen.flush()
+    assert fake.bodies("/api/mcp/route/turn") == []

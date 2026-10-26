@@ -65,7 +65,7 @@ The Claude Code plugin works through hooks. This is what carries over to a Pydan
 | Claude Code plugin | This capability |
 | --- | --- |
 | Injects the team-memory rule at session start | Yes: added to the agent's instructions (`instructions=False` to opt out) |
-| Records each prompt and turn | Records each finished run |
+| Records each prompt and turn | Records each run, including one that fails or is cancelled (what it did so far) |
 | Honors on / off / silent / incognito and plan limits | Not yet |
 | Sends repo, branch and commit with each turn | Only the `workspace` you pass |
 | Code search, team skills, commit and PR linking | Not yet |
@@ -74,6 +74,8 @@ The Claude Code plugin works through hooks. This is what carries over to a Pydan
 
 - A Glen failure never fails a run. Search returns a short message to the model; recording
   retries transient errors (429/5xx) three times with the same idempotency key, then logs.
+- A run that fails or is cancelled is recorded too (what it did so far, ending with a note of how it
+  ended), and its error still raises. A run that fails before its first model request records nothing.
 - Only this run's new messages are sent, with tool calls, tool results and thinking as
   ordered segments. System prompts and non-text prompt content (images, audio) are not sent.
 - Everything recorded becomes real team memory. Don't point test runs at your real org.
