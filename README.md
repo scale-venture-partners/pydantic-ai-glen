@@ -50,12 +50,25 @@ covered with no wrapper code.
 | `api_key`, `org_id`, `url` | env vars | Constructor values win over the environment |
 | `search` | `True` | Expose the `glen_search` tool |
 | `record` | `True` | Send finished runs to Glen |
+| `instructions` | `True` | Tell the agent to search Glen before changing a system the team already worked on (needs `search`). Turn it off if your own prompt says it |
 | `background` | `True` | Upload without delaying the run. Use `False` with `run_sync` |
 | `agent_name`, `agent_version` | `"pydantic-ai"`, `None` | Reported to Glen |
 | `workspace` | `None` | `cwd`, `repoName`, `branch`, `commit`, `remoteUrl` |
 
 Conversations are grouped by Pydantic AI's `conversation_id`. Pass your own thread id to
 `agent.run(..., conversation_id=...)` to keep one Glen conversation across runs.
+
+### Compared with the Claude Code plugin
+
+The Claude Code plugin works through hooks. This is what carries over to a Pydantic AI agent:
+
+| Claude Code plugin | This capability |
+| --- | --- |
+| Injects the team-memory rule at session start | Yes: added to the agent's instructions (`instructions=False` to opt out) |
+| Records each prompt and turn | Records each finished run |
+| Honors on / off / silent / incognito and plan limits | Not yet |
+| Sends repo, branch and commit with each turn | Only the `workspace` you pass |
+| Code search, team skills, commit and PR linking | Not yet |
 
 ### Behavior
 
