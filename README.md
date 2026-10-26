@@ -53,6 +53,7 @@ covered with no wrapper code.
 | `modes` | `True` | Follow the account's Glen mode: `off` uses and records nothing, `silent` records but hides the tool and instructions, `incognito` keeps the tool but records nothing |
 | `on_notice` | `None` | Called once per message when Glen says something the user should see (recording paused by a plan limit, a rejected key). Always logged as a warning too |
 | `code_search` | `True` | Add the `glen_code_search` tool when the agent runs in a git checkout with a remote: it traces lines of code (blame, then the commits' `Glen-Conversation` trailers) to the conversations that wrote them |
+| `skills` | `True` | Add `glen_skill_search` and `glen_skill_use`: the team's shared skills. A skill's bundled files are written to a new temporary directory (paths that escape it are refused) and `${GLEN_SKILL_DIR}` in the instructions points there |
 | `link_commits` | `True` | After a run that committed, tell Glen which commits belong to the conversation so code search and the PR reviewer can trace them. Needs a git checkout with a remote and `on` mode |
 | `instructions` | `True` | Tell the agent to search Glen before changing a system the team already worked on (needs `search`). Turn it off if your own prompt says it |
 | `background` | `True` | Upload without delaying the run. Use `False` with `run_sync` |
@@ -74,7 +75,9 @@ The Claude Code plugin works through hooks. This is what carries over to a Pydan
 | Sends repo, branch and commit with each turn | Yes: read from git in the current directory (`workspace=None` to opt out) |
 | Code search (`glen code-search`) | Yes: the `glen_code_search` tool, offered in a git checkout with a remote |
 | Links commits to the conversation | Yes: after a run that ran `git commit` in the checkout, each commit is linked (`link_commits=False` to opt out) |
-| Team skills | Not yet |
+| Team skills (`glen skill search` / `use`) | Yes: `glen_skill_search` and `glen_skill_use` (not the per-turn skill suggestions, see below) |
+
+The plugin also shows a banner when Glen thinks a saved skill fits your prompt (`skillsToOffer` in each turn response). That only makes sense with a person reading the reply, so a library agent does not get it; it can search skills itself.
 
 ### Behavior
 

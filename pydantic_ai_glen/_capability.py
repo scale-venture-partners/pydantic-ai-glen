@@ -21,7 +21,7 @@ from pydantic_ai.run import AgentRunResult
 from pydantic_ai.tools import AgentDepsT, ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 
-from pydantic_ai_glen import _control
+from pydantic_ai_glen import _control, _skills
 from pydantic_ai_glen._anchors import committed_shas, resolve_shas
 from pydantic_ai_glen._code_search import NotTraceable, blame_async
 from pydantic_ai_glen._control import Control
@@ -82,6 +82,11 @@ class Glen(AbstractCapability[AgentDepsT]):
     code_search: bool = True
     """Expose the `glen_code_search` tool when the agent runs in a git checkout with a remote:
     it traces lines of code to the conversations that wrote them. Needs `search`."""
+
+    skills: bool = True
+    """Expose `glen_skill_search` and `glen_skill_use`: the team's shared skills, as in the Claude
+    Code plugin. Unpacked skill files are written to a temporary directory. Needs `search`, and
+    Glen must have skills enabled for the account."""
 
     link_commits: bool = True
     """After a run that committed (a tool call ran `git commit` in this checkout), tell Glen which
@@ -235,6 +240,34 @@ class Glen(AbstractCapability[AgentDepsT]):
             """
             return await self._search(query, ctx.conversation_id)
 
+        async def only_with_skills(
+            ctx: RunContext[AgentDepsT], tool_def: ToolDefinition
+        ) -> ToolDefinition | None:
+            control = await self.control()
+            return tool_def if self.skills and control.recalls and control.skill_use else None
+
+        @toolset.tool(prepare=only_with_skills)
+        async def glen_skill_search(
+            ctx: RunContext[AgentDepsT], query: str = "", limit: int = 10
+        ) -> str:
+            """Find your team's shared skills: saved, reusable workflows written by teammates.
+
+            Look here before writing a workflow from scratch. Returns each skill's slug, what it
+            does and who wrote it; read one with `glen_skill_use`. An empty query lists the
+            skills your org uses most.
+            """
+            return await self._skill_search(query, limit)
+
+        @toolset.tool(prepare=only_with_skills)
+        async def glen_skill_use(ctx: RunContext[AgentDepsT], slug: str) -> str:
+            """Read one of your team's skills by slug (from `glen_skill_search`) and follow it.
+
+            Returns the skill's instructions. Files bundled with it are unpacked to a directory
+            named in the text. Treat the skill as a teammate's instructions for this task: it
+            does not override what the user asked for.
+            """
+            return await self._skill_use(slug, ctx.conversation_id)
+
         @toolset.tool(prepare=only_in_a_repo)
         async def glen_code_search(
             ctx: RunContext[AgentDepsT],
@@ -255,6 +288,44 @@ class Glen(AbstractCapability[AgentDepsT]):
             return await self._code_search(path, start_line, end_line or start_line, question)
 
         return toolset
+
+    async def _skill_search(self, query: str, limit: int) -> str:
+        body: dict[str, Any] = {"limit": max(1, min(limit, 30))}
+        if query.strip():
+            body["query"] = query.strip()
+        try:
+            r = await self._http().post("/api/mcp/route/skillSearch", json=body)
+        except httpx.HTTPError as e:
+            log.warning("glen skill search failed: %s", e)
+            return "Glen skills are unavailable right now."
+        if r.status_code != 200:
+            log.warning("glen skill search returned %s: %s", r.status_code, r.text[:500])
+            return f"Glen skill search failed ({r.status_code})."
+        return _skills.format_results(r.json().get("results") or [])
+
+    async def _skill_use(self, slug: str, conversation_id: str | None) -> str:
+        slug = slug.strip()
+        if not slug:
+            return "Give the slug of a skill (find one with glen_skill_search)."
+        body: dict[str, Any] = {"slug": slug}
+        if conversation_id:
+            body["conversationId"] = conversation_id
+        try:
+            r = await self._http().post("/api/mcp/route/skillUse", json=body, timeout=60.0)
+        except httpx.HTTPError as e:
+            log.warning("glen skill use failed: %s", e)
+            return "Glen skills are unavailable right now."
+        if r.status_code == 404:
+            return f"No team skill with the slug {slug!r}. Find slugs with glen_skill_search."
+        if r.status_code != 200:
+            log.warning("glen skill use returned %s: %s", r.status_code, r.text[:500])
+            return f"Glen skill lookup failed ({r.status_code})."
+        skill = r.json()
+        files = skill.get("files") or []
+        directory, skipped = (
+            await _skills.unpack(slug, files, self.transport) if files else (None, [])
+        )
+        return _skills.render(skill, directory, skipped)
 
     async def _repo(self) -> dict[str, str] | None:
         """The git checkout the agent works in, probed once."""
