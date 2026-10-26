@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import logging
 import os
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -16,9 +18,11 @@ from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.run import AgentRunResult
-from pydantic_ai.tools import AgentDepsT
+from pydantic_ai.tools import AgentDepsT, ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 
+from pydantic_ai_glen import _control
+from pydantic_ai_glen._control import Control
 from pydantic_ai_glen._git import detect_workspace
 from pydantic_ai_glen._messages import to_glen_messages
 
@@ -29,6 +33,13 @@ log = logging.getLogger("glen")
 DEFAULT_URL = "https://app.tryglen.com"
 _RETRYABLE = (429, 500, 502, 503, 504)
 _ATTEMPTS = 3
+# Rejections that retrying cannot fix and the user has to act on.
+_LASTING = {
+    401: "Glen rejected the API key or organization id, so runs are not being recorded.",
+    402: "Glen needs a paid plan to keep recording; runs are not being recorded.",
+    403: "Glen does not allow this key to record; runs are not being recorded.",
+    426: "This pydantic-ai-glen version is too old for Glen; upgrade it to keep recording.",
+}
 
 # Paid for on every request, so keep it short. Mirrors what the Claude Code plugin injects.
 _INSTRUCTIONS = (
@@ -82,6 +93,15 @@ class Glen(AbstractCapability[AgentDepsT]):
     directory (nothing is recorded outside a repository), a dict is used as given, `None` sends
     none."""
 
+    modes: bool = True
+    """Follow the account's Glen mode, as the Claude Code plugin does: `off` uses and records
+    nothing, `silent` records but hides the tool and instructions, `incognito` keeps the tool
+    but records nothing. The mode is read from Glen about once a minute."""
+
+    on_notice: Callable[[str], None] | None = field(default=None, repr=False)
+    """Called once per message when Glen says something the user should see: recording is paused
+    by a plan limit, or the key is rejected. The same message is always logged as a warning."""
+
     retry_backoff: float = 1.0
     """Base seconds between recording retries, doubled each attempt."""
 
@@ -92,6 +112,8 @@ class Glen(AbstractCapability[AgentDepsT]):
     _pending: set[asyncio.Task[None]] = field(default_factory=set, init=False, repr=False)
     _history_len: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _latest: dict[str, list[ModelMessage]] = field(default_factory=dict, init=False, repr=False)
+    _control: tuple[float, Control] | None = field(default=None, init=False, repr=False)
+    _noticed: set[str] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.api_key = self.api_key or os.environ.get("GLEN_API_KEY")
@@ -118,17 +140,70 @@ class Glen(AbstractCapability[AgentDepsT]):
             )
         return self._client
 
-    def get_instructions(self) -> str | None:
+    async def control(self) -> Control:
+        """What the account allows right now: cached for a minute, and Glen being unreachable
+        leaves the last known answer (or `on`) in place rather than failing a run."""
+        if not self.modes or not (self.search or self.record):
+            return Control()
+        now = time.monotonic()
+        if self._control is not None and now < self._control[0]:
+            return self._control[1]
+        known = self._control[1] if self._control else Control()
+        try:
+            r = await self._http().post(
+                "/api/mcp/route/controlStatus", json={}, timeout=_control.TIMEOUT
+            )
+            parsed = _control.parse_control(r.json()) if r.status_code == 200 else None
+        except (httpx.HTTPError, ValueError):
+            parsed = None
+        if parsed is None:
+            log.debug("glen control status unavailable; keeping %s", known.mode)
+            self._control = (now + _control.FAILURE_TTL, known)
+            return known
+        self._control = (now + _control.TTL, parsed)
+        return parsed
+
+    def _learn_mode(self, data: dict[str, Any]) -> None:
+        """A turn response carries the current mode too; it is fresher than the cache."""
+        mode = _control.mode_of(data)
+        if mode is None or not self.modes:
+            return
+        known = self._control[1] if self._control else Control()
+        self._control = (time.monotonic() + _control.TTL, Control(mode, known.skill_use))
+
+    def _notice(self, message: str) -> None:
+        if message in self._noticed:
+            return
+        self._noticed.add(message)
+        log.warning("glen: %s", message)
+        if self.on_notice is not None:
+            try:
+                self.on_notice(message)
+            except Exception:
+                log.exception("glen on_notice failed")
+
+    def get_instructions(self) -> Any:
         if not (self.search and self.instructions):
             return None
-        return _INSTRUCTIONS.format(url=self.url)
+
+        async def instructions(ctx: RunContext[AgentDepsT]) -> str | None:
+            if not (await self.control()).recalls:
+                return None
+            return _INSTRUCTIONS.format(url=self.url)
+
+        return instructions
 
     def get_toolset(self) -> AbstractToolset[AgentDepsT] | None:
         if not self.search:
             return None
         toolset: FunctionToolset[AgentDepsT] = FunctionToolset()
 
-        @toolset.tool
+        async def only_when_recalling(
+            ctx: RunContext[AgentDepsT], tool_def: ToolDefinition
+        ) -> ToolDefinition | None:
+            return tool_def if (await self.control()).recalls else None
+
+        @toolset.tool(prepare=only_when_recalling)
         async def glen_search(ctx: RunContext[AgentDepsT], query: str) -> str:
             """Search the team's shared memory: past agent conversations, decisions,
             incidents, and why things were built the way they were.
@@ -166,6 +241,7 @@ class Glen(AbstractCapability[AgentDepsT]):
         # Where this run's own messages start. The run-level context does not follow the run,
         # so a run that ends before it has a result is rebuilt from the last model request.
         self._history_len[ctx.run_id] = len(ctx.messages)
+        await self.control()
 
     async def before_model_request(
         self, ctx: RunContext[AgentDepsT], request_context: ModelRequestContext
@@ -214,7 +290,7 @@ class Glen(AbstractCapability[AgentDepsT]):
         messages: list[ModelMessage],
         output: Any,
     ) -> None:
-        if not self.record:
+        if not self.record or not (await self.control()).records:
             return
         try:
             body = self._turn_body(
@@ -269,13 +345,28 @@ class Glen(AbstractCapability[AgentDepsT]):
                 return
             else:
                 if r.status_code == 200:
+                    self._read_turn_response(r)
                     return
                 if r.status_code not in _RETRYABLE:
                     log.warning("glen record rejected %s: %s", r.status_code, r.text[:500])
+                    if r.status_code in _LASTING:
+                        self._notice(_LASTING[r.status_code])
                     return
                 log.warning("glen record attempt %d got %s", attempt + 1, r.status_code)
             if attempt < _ATTEMPTS - 1:
                 await asyncio.sleep(self.retry_backoff * 2**attempt)
+
+    def _read_turn_response(self, r: httpx.Response) -> None:
+        try:
+            data = r.json()
+        except ValueError:
+            return
+        if not isinstance(data, dict):
+            return
+        self._learn_mode(data)
+        paused = data.get("recordingPaused")
+        if isinstance(paused, dict) and isinstance(paused.get("message"), str):
+            self._notice(paused["message"])
 
     async def flush(self) -> None:
         """Wait for in-flight recordings to finish."""
