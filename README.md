@@ -52,6 +52,7 @@ covered with no wrapper code.
 | `record` | `True` | Send finished runs to Glen |
 | `modes` | `True` | Follow the account's Glen mode: `off` uses and records nothing, `silent` records but hides the tool and instructions, `incognito` keeps the tool but records nothing |
 | `on_notice` | `None` | Called once per message when Glen says something the user should see (recording paused by a plan limit, a rejected key). Always logged as a warning too |
+| `code_search` | `True` | Add the `glen_code_search` tool when the agent runs in a git checkout with a remote: it traces lines of code (blame, then the commits' `Glen-Conversation` trailers) to the conversations that wrote them |
 | `instructions` | `True` | Tell the agent to search Glen before changing a system the team already worked on (needs `search`). Turn it off if your own prompt says it |
 | `background` | `True` | Upload without delaying the run. Use `False` with `run_sync` |
 | `agent_name`, `agent_version` | `"pydantic-ai"`, `None` | Reported to Glen |
@@ -70,7 +71,8 @@ The Claude Code plugin works through hooks. This is what carries over to a Pydan
 | Records each prompt and turn | Records each run, including one that fails or is cancelled (what it did so far) |
 | Honors on / off / silent / incognito and plan limits | Yes: the mode is read from Glen about once a minute (`modes=False` to ignore it); plan limits and a rejected key reach `on_notice` |
 | Sends repo, branch and commit with each turn | Yes: read from git in the current directory (`workspace=None` to opt out) |
-| Code search, team skills, commit and PR linking | Not yet |
+| Code search (`glen code-search`) | Yes: the `glen_code_search` tool, offered in a git checkout with a remote |
+| Team skills, commit and PR linking | Not yet |
 
 ### Behavior
 

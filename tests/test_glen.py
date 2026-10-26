@@ -25,6 +25,7 @@ class FakeGlen:
         mode: str = "on",
         control_status: int = 200,
         turn_json: dict[str, Any] | None = None,
+        code_search_json: dict[str, Any] | None = None,
     ):
         self.requests: list[httpx.Request] = []
         self.turn_statuses = turn_statuses or []
@@ -32,6 +33,11 @@ class FakeGlen:
         self.mode = mode
         self.control_status = control_status
         self.turn_json = turn_json or {}
+        self.code_search_json = code_search_json or {
+            "state": "anchor_found",
+            "markdown": "# Why this code is the way it is\n\nDana asked for it.",
+            "conversationCount": 1,
+        }
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -39,6 +45,8 @@ class FakeGlen:
             return httpx.Response(
                 200, json={"answer": self.answer, "gaps": ["no ticket found"], "citations": []}
             )
+        if request.url.path == "/api/mcp/route/codeSearch":
+            return httpx.Response(200, json=self.code_search_json)
         if request.url.path == "/api/mcp/route/controlStatus":
             return httpx.Response(
                 self.control_status,
@@ -549,3 +557,125 @@ async def test_a_rejected_key_is_reported_to_the_app_not_just_logged() -> None:
     await agent.run("second")
     await glen.flush()
     assert len(notices) == 1 and "rejected the API key" in notices[0]
+
+
+def commit_file(repo: Any, name: str, text: str, message: str) -> str:
+    (repo / name).write_text(text)
+    subprocess.run(["git", "-C", str(repo), "add", name], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", message], check=True, capture_output=True
+    )
+    done = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    )
+    return done.stdout.strip()
+
+
+def code_search_call(**args: Any) -> FunctionModel:
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(parts=[ToolCallPart("glen_code_search", args)])
+        return ModelResponse(parts=[TextPart("done")])
+
+    return FunctionModel(respond)
+
+
+def tool_result(result: Any) -> str:
+    returns = [
+        part.content
+        for message in result.all_messages()
+        for part in getattr(message, "parts", [])
+        if part.part_kind == "tool-return"
+    ]
+    return str(returns[-1])
+
+
+async def test_code_search_traces_the_blamed_commit_and_its_trailer(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "work"
+    git_repo(repo, remote="git@github.com:acme/widgets.git")
+    sha = commit_file(
+        repo,
+        "retry.py",
+        "RETRY_MS = 30_000\nbackoff = 2\n",
+        "Raise retry backoff\n\nGlen-Conversation: conv-42",
+    )
+    monkeypatch.chdir(repo)
+    fake = FakeGlen()
+    glen = make_glen(fake)
+
+    result = await Agent(
+        code_search_call(path="retry.py", start_line=1, question="why 30s?"),
+        capabilities=[glen],
+    ).run("explain")
+
+    [body] = fake.bodies("/api/mcp/route/codeSearch")
+    assert body["shas"] == [sha]
+    assert body["trailerConversationIds"] == ["conv-42"]
+    assert body["repoUrl"] == "https://github.com/acme/widgets"
+    assert body["branch"] == "main"
+    assert body["query"] == "why 30s?"
+    assert "Dana asked for it." in tool_result(result)
+
+
+async def test_code_search_without_a_trace_says_so(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "work"
+    git_repo(repo, remote="https://github.com/acme/widgets")
+    commit_file(repo, "a.py", "x = 1\n", "add a")
+    monkeypatch.chdir(repo)
+    fake = FakeGlen(code_search_json={"state": "no_anchor", "markdown": "", "conversationCount": 0})
+
+    result = await Agent(
+        code_search_call(path="a.py", start_line=1, question="why?"),
+        capabilities=[make_glen(fake)],
+    ).run("explain")
+
+    assert "No Glen trace found" in tool_result(result)
+
+
+async def test_code_search_does_not_ask_glen_about_lines_that_are_not_committed(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "work"
+    git_repo(repo, remote="https://github.com/acme/widgets")
+    commit_file(repo, "a.py", "x = 1\n", "add a")
+    (repo / "a.py").write_text("x = 1\ny = 2\n")
+    monkeypatch.chdir(repo)
+    fake = FakeGlen()
+
+    result = await Agent(
+        code_search_call(path="a.py", start_line=2, question="why?"),
+        capabilities=[make_glen(fake)],
+    ).run("explain")
+
+    assert "not committed yet" in tool_result(result)
+    assert fake.bodies("/api/mcp/route/codeSearch") == []
+
+
+async def test_code_search_is_offered_only_in_a_repo_with_a_remote(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def tools_seen(**kwargs: Any) -> list[str]:
+        seen: list[dict[str, Any]] = []
+        await Agent(seeing_model(seen), capabilities=[make_glen(FakeGlen(), **kwargs)]).run("x")
+        return seen[0]["tools"]
+
+    with_remote = tmp_path / "with"
+    git_repo(with_remote, remote="https://github.com/acme/widgets")
+    monkeypatch.chdir(with_remote)
+    assert "glen_code_search" in await tools_seen()
+    assert "glen_code_search" not in await tools_seen(code_search=False)
+
+    no_remote = tmp_path / "without"
+    git_repo(no_remote)
+    monkeypatch.chdir(no_remote)
+    assert "glen_code_search" not in await tools_seen()
+
+    monkeypatch.chdir(with_remote)
+    off = FakeGlen(mode="off")
+    seen: list[dict[str, Any]] = []
+    await Agent(seeing_model(seen), capabilities=[make_glen(off)]).run("x")
+    assert "glen_code_search" not in seen[0]["tools"]

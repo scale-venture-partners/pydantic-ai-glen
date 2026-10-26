@@ -22,6 +22,7 @@ from pydantic_ai.tools import AgentDepsT, ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 
 from pydantic_ai_glen import _control
+from pydantic_ai_glen._code_search import NotTraceable, blame_async
 from pydantic_ai_glen._control import Control
 from pydantic_ai_glen._git import detect_workspace
 from pydantic_ai_glen._messages import to_glen_messages
@@ -77,6 +78,10 @@ class Glen(AbstractCapability[AgentDepsT]):
     record: bool = True
     """Send each finished run to Glen."""
 
+    code_search: bool = True
+    """Expose the `glen_code_search` tool when the agent runs in a git checkout with a remote:
+    it traces lines of code to the conversations that wrote them. Needs `search`."""
+
     instructions: bool = True
     """Tell the agent to search Glen before changing a system the team already worked on.
     Only used with `search`; turn it off if your own prompt says it."""
@@ -114,6 +119,7 @@ class Glen(AbstractCapability[AgentDepsT]):
     _latest: dict[str, list[ModelMessage]] = field(default_factory=dict, init=False, repr=False)
     _control: tuple[float, Control] | None = field(default=None, init=False, repr=False)
     _noticed: set[str] = field(default_factory=set, init=False, repr=False)
+    _repo_probe: list[dict[str, str] | None] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.api_key = self.api_key or os.environ.get("GLEN_API_KEY")
@@ -203,6 +209,14 @@ class Glen(AbstractCapability[AgentDepsT]):
         ) -> ToolDefinition | None:
             return tool_def if (await self.control()).recalls else None
 
+        async def only_in_a_repo(
+            ctx: RunContext[AgentDepsT], tool_def: ToolDefinition
+        ) -> ToolDefinition | None:
+            if not (self.code_search and (await self.control()).recalls):
+                return None
+            repo = await self._repo()
+            return tool_def if repo and repo.get("remoteUrl") else None
+
         @toolset.tool(prepare=only_when_recalling)
         async def glen_search(ctx: RunContext[AgentDepsT], query: str) -> str:
             """Search the team's shared memory: past agent conversations, decisions,
@@ -215,7 +229,65 @@ class Glen(AbstractCapability[AgentDepsT]):
             """
             return await self._search(query, ctx.conversation_id)
 
+        @toolset.tool(prepare=only_in_a_repo)
+        async def glen_code_search(
+            ctx: RunContext[AgentDepsT],
+            path: str,
+            start_line: int,
+            question: str,
+            end_line: int | None = None,
+        ) -> str:
+            """Find the past agent conversations that wrote or changed specific lines of code,
+            to learn why they are the way they are.
+
+            `path` is a file in this repository (relative to the working directory) and the
+            lines are 1-based and inclusive; `end_line` defaults to `start_line`. Ask what you
+            need to know about those lines (the reason, the alternatives tried, who decided).
+            Only committed lines can be traced, and code from before Glen was recording has no
+            trace.
+            """
+            return await self._code_search(path, start_line, end_line or start_line, question)
+
         return toolset
+
+    async def _repo(self) -> dict[str, str] | None:
+        """The git checkout the agent works in, probed once."""
+        if not self._repo_probe:
+            cwd = self.workspace.get("cwd") if isinstance(self.workspace, dict) else None
+            self._repo_probe.append(await detect_workspace(cwd))
+        return self._repo_probe[0]
+
+    async def _code_search(self, path: str, start: int, end: int, question: str) -> str:
+        repo = await self._repo()
+        if not repo or not repo.get("remoteUrl"):
+            return "Code search needs a git repository with a remote."
+        try:
+            blamed = await blame_async(repo["cwd"], path, start, end)
+        except NotTraceable as e:
+            return str(e)
+        body: dict[str, Any] = {
+            "repoUrl": repo["remoteUrl"],
+            "shas": blamed.shas,
+            "trailerConversationIds": blamed.trailer_conversation_ids,
+            "query": question,
+        }
+        if repo.get("branch"):
+            body["branch"] = repo["branch"]
+        try:
+            r = await self._http().post("/api/mcp/route/codeSearch", json=body, timeout=30.0)
+        except httpx.HTTPError as e:
+            log.warning("glen code search failed: %s", e)
+            return "Glen code search is unavailable right now."
+        if r.status_code != 200:
+            log.warning("glen code search returned %s: %s", r.status_code, r.text[:500])
+            return f"Glen code search failed ({r.status_code})."
+        data = r.json()
+        if data.get("state") == "no_anchor" or not data.get("markdown"):
+            return (
+                "No Glen trace found for those lines (code from before Glen, "
+                "or committed without Glen recording)."
+            )
+        return str(data["markdown"])
 
     async def _search(self, query: str, conversation_id: str | None) -> str:
         body: dict[str, Any] = {"query": query}
