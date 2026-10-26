@@ -246,3 +246,28 @@ async def test_structured_output_and_multimodal_prompt_are_serialized() -> None:
     [turn] = fake.bodies("/api/mcp/route/turn")
     assert turn["messages"][0]["content"] == "look at this"
     assert json.loads(turn["messages"][-1]["content"]) == {"x": 3}
+
+
+def capturing_model(seen: list[str | None]) -> FunctionModel:
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        seen.append(info.instructions)
+        return ModelResponse(parts=[TextPart("ok")])
+
+    return FunctionModel(respond)
+
+
+async def test_the_agent_is_told_to_search_glen_before_changing_a_system() -> None:
+    seen: list[str | None] = []
+    glen = make_glen(FakeGlen(), url="https://glen.example")
+    await Agent(capturing_model(seen), capabilities=[glen]).run("fix billing")
+    assert seen[0] is not None
+    assert "glen_search" in seen[0]
+    assert "https://glen.example/<owner>/<repo>/pull/<number>" in seen[0]
+
+
+async def test_instructions_follow_the_search_tool_and_can_be_turned_off() -> None:
+    for kwargs in ({"instructions": False}, {"search": False}):
+        seen: list[str | None] = []
+        glen = make_glen(FakeGlen(), **kwargs)
+        await Agent(capturing_model(seen), capabilities=[glen]).run("fix billing")
+        assert not seen[0] or "glen_search" not in seen[0]

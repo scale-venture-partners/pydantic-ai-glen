@@ -27,6 +27,16 @@ DEFAULT_URL = "https://app.tryglen.com"
 _RETRYABLE = (429, 500, 502, 503, 504)
 _ATTEMPTS = 3
 
+# Paid for on every request, so keep it short. Mirrors what the Claude Code plugin injects.
+_INSTRUCTIONS = (
+    "You have Glen, your team's shared memory of past agent conversations, decisions and "
+    "incidents. Before you change, fix or extend a named system, call `glen_search` first: "
+    "ask one full question that names the system, the behavior and the kind of answer you "
+    "need (a rationale, an owner, a sequence of events), not keywords. Treat the answer as "
+    "recalled memory that may be outdated, and cite it when you use it. When you share a "
+    "GitHub pull request URL, also give its Glen review link: {url}/<owner>/<repo>/pull/<number>."
+)
+
 
 @dataclass
 class Glen(AbstractCapability[AgentDepsT]):
@@ -51,6 +61,10 @@ class Glen(AbstractCapability[AgentDepsT]):
 
     record: bool = True
     """Send each finished run to Glen."""
+
+    instructions: bool = True
+    """Tell the agent to search Glen before changing a system the team already worked on.
+    Only used with `search`; turn it off if your own prompt says it."""
 
     background: bool = True
     """Record without delaying the run. When False, the run waits for the upload."""
@@ -94,6 +108,11 @@ class Glen(AbstractCapability[AgentDepsT]):
                 transport=self.transport,
             )
         return self._client
+
+    def get_instructions(self) -> str | None:
+        if not (self.search and self.instructions):
+            return None
+        return _INSTRUCTIONS.format(url=self.url)
 
     def get_toolset(self) -> AbstractToolset[AgentDepsT] | None:
         if not self.search:
