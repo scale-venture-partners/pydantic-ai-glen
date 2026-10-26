@@ -35,6 +35,8 @@ Issues = "https://github.com/scale-venture-partners/pydantic-ai-glen/issues"
 dev = [
   "pytest>=7.4",
   "pytest-asyncio>=0.23",
+  "pytest-cov>=5.0",
+  "mutmut>=3.0",
   "ruff>=0.3.7,<0.17",
 ]
 
@@ -56,3 +58,16 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B"]
+
+[tool.coverage.run]
+source = ["pydantic_ai_glen"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.mutmut]
+source_paths = ["pydantic_ai_glen/"]
+pytest_add_cli_args_test_selection = ["tests/"]
+pytest_add_cli_args = ["-p", "no:cacheprovider"]

@@ -32,3 +32,5 @@ coverage.xml
 uv.lock
 .env
 .ruff_cache/
+mutants/
+.coverage
