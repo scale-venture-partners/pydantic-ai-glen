@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -26,6 +28,10 @@ class FakeGlen:
         control_status: int = 200,
         turn_json: dict[str, Any] | None = None,
         code_search_json: dict[str, Any] | None = None,
+        skill_use: bool = True,
+        skills: list[dict[str, Any]] | None = None,
+        skill: dict[str, Any] | None = None,
+        skill_status: int = 200,
     ):
         self.requests: list[httpx.Request] = []
         self.turn_statuses = turn_statuses or []
@@ -33,6 +39,10 @@ class FakeGlen:
         self.mode = mode
         self.control_status = control_status
         self.turn_json = turn_json or {}
+        self.skill_use = skill_use
+        self.skills = skills or []
+        self.skill = skill or {}
+        self.skill_status = skill_status
         self.code_search_json = code_search_json or {
             "state": "anchor_found",
             "markdown": "# Why this code is the way it is\n\nDana asked for it.",
@@ -45,6 +55,12 @@ class FakeGlen:
             return httpx.Response(
                 200, json={"answer": self.answer, "gaps": ["no ticket found"], "citations": []}
             )
+        if request.url.host == "files.example":
+            return httpx.Response(200, content=b"#!/bin/sh\necho from-url\n")
+        if request.url.path == "/api/mcp/route/skillSearch":
+            return httpx.Response(200, json={"results": self.skills})
+        if request.url.path == "/api/mcp/route/skillUse":
+            return httpx.Response(self.skill_status, json=self.skill)
         if request.url.path == "/api/mcp/route/commitAnchor":
             return httpx.Response(200, json={"id": "anchor-1"})
         if request.url.path == "/api/mcp/route/codeSearch":
@@ -55,7 +71,7 @@ class FakeGlen:
                 json={
                     "mode": self.mode,
                     "skillCreation": True,
-                    "skillUse": True,
+                    "skillUse": self.skill_use,
                     "updatedAt": None,
                     "teamMemoryBlock": None,
                 },
@@ -794,3 +810,124 @@ async def test_a_commit_from_a_failed_run_is_still_linked(
     await glen.flush()
 
     assert [a["sha"] for a in fake.bodies("/api/mcp/route/commitAnchor")] == [head(repo)]
+
+
+def skill_call(name: str, **args: Any) -> FunctionModel:
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(parts=[ToolCallPart(name, args)])
+        return ModelResponse(parts=[TextPart("done")])
+
+    return FunctionModel(respond)
+
+
+SKILL = {
+    "slug": "debug-like-shawn",
+    "name": "Debug like Shawn",
+    "content": "Start with the logs. Helper: ${GLEN_SKILL_DIR}/check.sh",
+    "dependencies": [
+        {"name": "jq", "kind": "binary", "description": "json", "sourceUrl": "https://jq.example"}
+    ],
+    "updatedAt": "2026-10-01T09:00:00Z",
+    "author": {"name": "Shawn"},
+    "files": [],
+    "prefetch": [],
+}
+
+
+async def test_skill_tools_follow_the_mode_the_flag_and_the_account() -> None:
+    async def tools_seen(fake: FakeGlen, **kwargs: Any) -> list[str]:
+        seen: list[dict[str, Any]] = []
+        await Agent(seeing_model(seen), capabilities=[make_glen(fake, **kwargs)]).run("x")
+        return seen[0]["tools"]
+
+    assert {"glen_skill_search", "glen_skill_use"} <= set(await tools_seen(FakeGlen()))
+    assert "glen_skill_use" not in await tools_seen(FakeGlen(), skills=False)
+    assert "glen_skill_use" not in await tools_seen(FakeGlen(skill_use=False))
+    assert "glen_skill_use" not in await tools_seen(FakeGlen(mode="silent"))
+    assert "glen_skill_use" not in await tools_seen(FakeGlen(mode="off"))
+
+
+async def test_skill_search_lists_what_the_org_has() -> None:
+    fake = FakeGlen(
+        skills=[
+            {
+                "slug": "debug-like-shawn",
+                "name": "Debug like Shawn",
+                "description": "How Shawn triages a failing job",
+                "author": {"name": "Shawn"},
+                "orgUseCount": 7,
+            }
+        ]
+    )
+    result = await Agent(
+        skill_call("glen_skill_search", query="debug", limit=5), capabilities=[make_glen(fake)]
+    ).run("go")
+
+    assert fake.bodies("/api/mcp/route/skillSearch") == [{"limit": 5, "query": "debug"}]
+    text = tool_result(result)
+    assert "`debug-like-shawn`" in text and "by Shawn, used 7x" in text
+
+
+async def test_using_a_skill_returns_its_instructions_with_provenance() -> None:
+    fake = FakeGlen(skill=SKILL)
+    result = await Agent(
+        skill_call("glen_skill_use", slug="debug-like-shawn"), capabilities=[make_glen(fake)]
+    ).run("go", conversation_id="conv-9")
+
+    assert fake.bodies("/api/mcp/route/skillUse") == [
+        {"slug": "debug-like-shawn", "conversationId": "conv-9"}
+    ]
+    text = tool_result(result)
+    assert text.startswith('> Glen skill "Debug like Shawn" by Shawn, updated 2026-10-01')
+    assert "Start with the logs." in text
+    assert "- jq (binary): json (https://jq.example)" in text
+
+
+async def test_bundled_files_are_unpacked_and_the_directory_is_substituted() -> None:
+    skill = {
+        **SKILL,
+        "files": [
+            {
+                "path": "notes.md",
+                "isExecutable": False,
+                "contentType": "text/markdown",
+                "content": "hi",
+            },
+            {
+                "path": "bin/check.sh",
+                "isExecutable": True,
+                "contentType": "text/x-sh",
+                "url": "https://files.example/check.sh",
+            },
+            {
+                "path": "../evil.sh",
+                "isExecutable": True,
+                "contentType": "text/x-sh",
+                "content": "x",
+            },
+        ],
+    }
+    fake = FakeGlen(skill=skill)
+    result = await Agent(
+        skill_call("glen_skill_use", slug="debug-like-shawn"), capabilities=[make_glen(fake)]
+    ).run("go")
+
+    text = tool_result(result)
+    assert "${GLEN_SKILL_DIR}" not in text
+    directory = text.split("Helper: ")[1].split("/check.sh")[0]
+    assert (Path(directory) / "notes.md").read_text() == "hi"
+    script = Path(directory) / "bin" / "check.sh"
+    assert script.read_text().endswith("echo from-url\n") and os.access(script, os.X_OK)
+    assert not (Path(directory).parent / "evil.sh").exists()
+    assert "../evil.sh (unsafe path)" in text
+    download = [r for r in fake.requests if r.url.host == "files.example"]
+    assert download and "x-api-key" not in download[0].headers
+
+
+async def test_an_unknown_skill_says_so() -> None:
+    fake = FakeGlen(skill_status=404)
+    result = await Agent(
+        skill_call("glen_skill_use", slug="nope"), capabilities=[make_glen(fake)]
+    ).run("go")
+    assert "No team skill with the slug 'nope'" in tool_result(result)
