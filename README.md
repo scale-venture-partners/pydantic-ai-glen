@@ -42,7 +42,7 @@ result = await agent.run("why does the billing worker batch at 500?")
 await glen.flush()  # before a short-lived process exits
 ```
 
-Recording hooks into `after_run`, so `run`, `run_stream`, `iter` and `run_sync` are all
+Recording hooks into the run lifecycle, so `run`, `run_stream`, `iter` and `run_sync` are all
 covered with no wrapper code.
 
 | Option | Default | |
