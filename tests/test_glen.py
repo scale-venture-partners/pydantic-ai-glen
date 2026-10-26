@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from typing import Any
 
 import httpx
@@ -346,3 +347,78 @@ async def test_a_failed_run_is_not_recorded_when_record_is_off() -> None:
         await Agent(tool_then_fail(), capabilities=[glen]).run("x")
     await glen.flush()
     assert fake.bodies("/api/mcp/route/turn") == []
+
+
+def git_repo(path: Any, remote: str | None = None) -> None:
+    def git(*args: str) -> None:
+        subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True)
+
+    path.mkdir(parents=True, exist_ok=True)
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    git("config", "commit.gpgsign", "false")
+    git("commit", "-q", "--allow-empty", "-m", "first")
+    if remote:
+        git("remote", "add", "origin", remote)
+
+
+async def recorded_workspace(fake: FakeGlen, glen: Glen) -> dict[str, str] | None:
+    await Agent(text_model(), capabilities=[glen]).run("hi")
+    await glen.flush()
+    [body] = fake.bodies("/api/mcp/route/turn")
+    return body["additionalContext"].get("workspace")
+
+
+async def test_the_workspace_is_read_from_git_by_default(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    git_repo(tmp_path / "work", remote="https://user:token@GitHub.com/acme/widgets.git")
+    monkeypatch.chdir(tmp_path / "work")
+    fake = FakeGlen()
+
+    workspace = await recorded_workspace(fake, make_glen(fake))
+
+    assert workspace is not None
+    assert workspace["repoName"] == "work"
+    assert workspace["branch"] == "main"
+    assert workspace["remoteUrl"] == "https://github.com/acme/widgets"
+    assert len(workspace["commit"]) >= 7
+    assert "token" not in json.dumps(workspace)
+
+
+async def test_an_ssh_remote_becomes_an_https_url(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    git_repo(tmp_path / "work", remote="git@github.com:acme/widgets.git")
+    monkeypatch.chdir(tmp_path / "work")
+    fake = FakeGlen()
+
+    workspace = await recorded_workspace(fake, make_glen(fake))
+
+    assert workspace is not None
+    assert workspace["remoteUrl"] == "https://github.com/acme/widgets"
+
+
+async def test_outside_a_repository_no_workspace_is_sent(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    fake = FakeGlen()
+
+    assert await recorded_workspace(fake, make_glen(fake)) is None
+
+
+async def test_an_explicit_workspace_wins_and_none_turns_it_off(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    git_repo(tmp_path / "work", remote="https://github.com/acme/widgets")
+    monkeypatch.chdir(tmp_path / "work")
+
+    fake = FakeGlen()
+    explicit = {"repoName": "mine"}
+    assert await recorded_workspace(fake, make_glen(fake, workspace=explicit)) == explicit
+
+    fake = FakeGlen()
+    assert await recorded_workspace(fake, make_glen(fake, workspace=None)) is None
