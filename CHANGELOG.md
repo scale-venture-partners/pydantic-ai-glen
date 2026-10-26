@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 - 2026-10-26
+
+The capability now behaves much more like Glen's Claude Code plugin: it tells the agent to search first, follows the account's mode, records failed runs, ties conversations to the repo, and adds code search, commit linking and team skills. Every addition has an option to turn it off.
+
+### Upgrading
+
+- `workspace` now defaults to `"auto"`, so each recorded turn carries the current directory and its git repo, branch, commit and remote (credentials dropped). Pass `workspace=None` to send none, as before.
+- The agent's instructions now include a short paragraph about searching Glen (`instructions=False` removes it), and up to four new tools can appear (`glen_code_search`, `glen_skill_search`, `glen_skill_use`; `code_search=False`, `skills=False`). If your agent has its own prompt for Glen, you can drop it.
+- The first run, and then about once a minute, makes one extra request to Glen for the account's mode (3 s limit; Glen being unreachable leaves the agent as `on`). `modes=False` skips it.
+- A run that ends in an error or is cancelled is now recorded, and a run that committed now links its commits.
+
+### Changes
 
 - The agent is told to search Glen before changing a system the team already worked on, through the capability's instructions, as the Claude Code plugin does. `instructions=False` turns it off.
 - A run that fails or is cancelled is now recorded (what it did so far), where before only finished runs were. Its error still raises. A background-agent deadline is a cancellation, so those runs are no longer lost.

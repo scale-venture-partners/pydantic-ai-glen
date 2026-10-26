@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pydantic-ai-glen"
-version = "0.1.0"
+version = "0.2.0"
 description = "Pydantic AI capability that connects an agent to Glen's shared team memory"
 readme = "README.md"
 license = { file = "LICENSE" }
