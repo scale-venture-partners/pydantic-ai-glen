@@ -19,11 +19,19 @@ class FakeGlen:
     """Stands in for Glen's HTTP API at the network boundary; everything else runs for real."""
 
     def __init__(
-        self, turn_statuses: list[int] | None = None, answer: str = "because Dana said so"
+        self,
+        turn_statuses: list[int] | None = None,
+        answer: str = "because Dana said so",
+        mode: str = "on",
+        control_status: int = 200,
+        turn_json: dict[str, Any] | None = None,
     ):
         self.requests: list[httpx.Request] = []
         self.turn_statuses = turn_statuses or []
         self.answer = answer
+        self.mode = mode
+        self.control_status = control_status
+        self.turn_json = turn_json or {}
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -31,8 +39,19 @@ class FakeGlen:
             return httpx.Response(
                 200, json={"answer": self.answer, "gaps": ["no ticket found"], "citations": []}
             )
+        if request.url.path == "/api/mcp/route/controlStatus":
+            return httpx.Response(
+                self.control_status,
+                json={
+                    "mode": self.mode,
+                    "skillCreation": True,
+                    "skillUse": True,
+                    "updatedAt": None,
+                    "teamMemoryBlock": None,
+                },
+            )
         status = self.turn_statuses.pop(0) if self.turn_statuses else 200
-        return httpx.Response(status, json={})
+        return httpx.Response(status, json=self.turn_json)
 
     def bodies(self, path: str) -> list[dict[str, Any]]:
         return [json.loads(r.content) for r in self.requests if r.url.path == path]
@@ -422,3 +441,111 @@ async def test_an_explicit_workspace_wins_and_none_turns_it_off(
 
     fake = FakeGlen()
     assert await recorded_workspace(fake, make_glen(fake, workspace=None)) is None
+
+
+def seeing_model(seen: list[dict[str, Any]]) -> FunctionModel:
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        seen.append(
+            {
+                "tools": [t.name for t in info.function_tools],
+                "instructions": info.instructions or "",
+            }
+        )
+        return ModelResponse(parts=[TextPart("ok")])
+
+    return FunctionModel(respond)
+
+
+async def run_in_mode(mode: str) -> tuple[FakeGlen, dict[str, Any]]:
+    fake = FakeGlen(mode=mode)
+    glen = make_glen(fake)
+    seen: list[dict[str, Any]] = []
+    await Agent(seeing_model(seen), capabilities=[glen]).run("fix billing")
+    await glen.flush()
+    return fake, seen[0]
+
+
+async def test_on_recalls_and_records() -> None:
+    fake, seen = await run_in_mode("on")
+    assert "glen_search" in seen["tools"] and "glen_search" in seen["instructions"]
+    assert len(fake.bodies("/api/mcp/route/turn")) == 1
+
+
+async def test_off_uses_and_records_nothing() -> None:
+    fake, seen = await run_in_mode("off")
+    assert "glen_search" not in seen["tools"] and "glen_search" not in seen["instructions"]
+    assert fake.bodies("/api/mcp/route/turn") == []
+
+
+async def test_silent_records_but_surfaces_nothing() -> None:
+    fake, seen = await run_in_mode("silent")
+    assert "glen_search" not in seen["tools"] and "glen_search" not in seen["instructions"]
+    assert len(fake.bodies("/api/mcp/route/turn")) == 1
+
+
+async def test_incognito_recalls_but_records_nothing() -> None:
+    fake, seen = await run_in_mode("incognito")
+    assert "glen_search" in seen["tools"] and "glen_search" in seen["instructions"]
+    assert fake.bodies("/api/mcp/route/turn") == []
+
+
+async def test_the_mode_is_looked_up_once_for_many_runs() -> None:
+    fake = FakeGlen()
+    glen = make_glen(fake)
+    agent = Agent(text_model(), capabilities=[glen])
+    for _ in range(3):
+        await agent.run("hi")
+    await glen.flush()
+    assert len(fake.bodies("/api/mcp/route/controlStatus")) == 1
+
+
+async def test_an_unreachable_control_status_leaves_glen_on() -> None:
+    fake = FakeGlen(control_status=500)
+    glen = make_glen(fake)
+    seen: list[dict[str, Any]] = []
+    await Agent(seeing_model(seen), capabilities=[glen]).run("hi")
+    await glen.flush()
+    assert "glen_search" in seen[0]["tools"]
+    assert len(fake.bodies("/api/mcp/route/turn")) == 1
+
+
+async def test_modes_false_never_asks_glen_for_the_mode() -> None:
+    fake = FakeGlen(mode="off")
+    glen = make_glen(fake, modes=False)
+    await Agent(text_model(), capabilities=[glen]).run("hi")
+    await glen.flush()
+    assert fake.bodies("/api/mcp/route/controlStatus") == []
+    assert len(fake.bodies("/api/mcp/route/turn")) == 1
+
+
+async def test_a_turn_response_that_says_incognito_stops_the_next_recording() -> None:
+    fake = FakeGlen(turn_json={"serverMode": "incognito"})
+    glen = make_glen(fake)
+    agent = Agent(text_model(), capabilities=[glen])
+    await agent.run("first")
+    await glen.flush()
+    await agent.run("second")
+    await glen.flush()
+    assert len(fake.bodies("/api/mcp/route/turn")) == 1
+
+
+async def test_a_paused_recording_is_reported_once() -> None:
+    notices: list[str] = []
+    fake = FakeGlen(turn_json={"recordingPaused": {"message": "Recording paused: plan limit."}})
+    glen = make_glen(fake, on_notice=notices.append)
+    agent = Agent(text_model(), capabilities=[glen])
+    await agent.run("first")
+    await agent.run("second")
+    await glen.flush()
+    assert notices == ["Recording paused: plan limit."]
+
+
+async def test_a_rejected_key_is_reported_to_the_app_not_just_logged() -> None:
+    notices: list[str] = []
+    fake = FakeGlen(turn_statuses=[401, 401])
+    glen = make_glen(fake, on_notice=notices.append)
+    agent = Agent(text_model(), capabilities=[glen])
+    await agent.run("first")
+    await agent.run("second")
+    await glen.flush()
+    assert len(notices) == 1 and "rejected the API key" in notices[0]
