@@ -7,7 +7,7 @@ import hashlib
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from pydantic_ai import RunContext
@@ -19,6 +19,7 @@ from pydantic_ai.run import AgentRunResult
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 
+from pydantic_ai_glen._git import detect_workspace
 from pydantic_ai_glen._messages import to_glen_messages
 
 __all__ = ("Glen",)
@@ -75,8 +76,11 @@ class Glen(AbstractCapability[AgentDepsT]):
     agent_name: str = "pydantic-ai"
     agent_version: str | None = None
 
-    workspace: dict[str, str] | None = None
-    """Optional `cwd`, `repoName`, `branch`, `commit`, `remoteUrl` for the recorded turns."""
+    workspace: dict[str, str] | Literal["auto"] | None = "auto"
+    """The `cwd`, `repoName`, `branch`, `commit` and `remoteUrl` recorded with each turn, which is
+    how Glen ties a conversation to a repo. `"auto"` reads them from git in the current
+    directory (nothing is recorded outside a repository), a dict is used as given, `None` sends
+    none."""
 
     retry_backoff: float = 1.0
     """Base seconds between recording retries, doubled each attempt."""
@@ -213,7 +217,9 @@ class Glen(AbstractCapability[AgentDepsT]):
         if not self.record:
             return
         try:
-            body = self._turn_body(conversation_id, run_id, messages, output)
+            body = self._turn_body(
+                conversation_id, run_id, messages, output, await self._workspace()
+            )
         except Exception:
             log.exception("glen could not build the turn payload")
             return
@@ -224,19 +230,25 @@ class Glen(AbstractCapability[AgentDepsT]):
         else:
             await self._send_turn(body)
 
+    async def _workspace(self) -> dict[str, str] | None:
+        if self.workspace == "auto":
+            return await detect_workspace()
+        return self.workspace or None
+
     def _turn_body(
         self,
         conversation_id: str | None,
         run_id: str,
         messages: list[ModelMessage],
         output: Any,
+        workspace: dict[str, str] | None,
     ) -> dict[str, Any]:
         agent: dict[str, str] = {"name": self.agent_name}
         if self.agent_version:
             agent["version"] = self.agent_version
         context: dict[str, Any] = {"agent": agent}
-        if self.workspace:
-            context["workspace"] = self.workspace
+        if workspace:
+            context["workspace"] = workspace
         key = f"{conversation_id}\0{run_id}"
         return {
             "conversationId": conversation_id,
