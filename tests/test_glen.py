@@ -45,6 +45,8 @@ class FakeGlen:
             return httpx.Response(
                 200, json={"answer": self.answer, "gaps": ["no ticket found"], "citations": []}
             )
+        if request.url.path == "/api/mcp/route/commitAnchor":
+            return httpx.Response(200, json={"id": "anchor-1"})
         if request.url.path == "/api/mcp/route/codeSearch":
             return httpx.Response(200, json=self.code_search_json)
         if request.url.path == "/api/mcp/route/controlStatus":
@@ -679,3 +681,116 @@ async def test_code_search_is_offered_only_in_a_repo_with_a_remote(
     seen: list[dict[str, Any]] = []
     await Agent(seeing_model(seen), capabilities=[make_glen(off)]).run("x")
     assert "glen_code_search" not in seen[0]["tools"]
+
+
+def committing_agent(repo: Any, command: str, glen: Glen) -> Agent[None, str]:
+    """An agent whose model runs `command` through a real shell tool in `repo`, then answers."""
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(parts=[ToolCallPart("shell", {"command": command})])
+        return ModelResponse(parts=[TextPart("done")])
+
+    agent: Agent[None, str] = Agent(FunctionModel(respond), capabilities=[glen])
+
+    @agent.tool_plain
+    def shell(command: str) -> str:
+        done = subprocess.run(
+            command, shell=True, cwd=repo, capture_output=True, text=True, check=False
+        )
+        return done.stdout + done.stderr
+
+    return agent
+
+
+def head(repo: Any) -> str:
+    done = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    )
+    return done.stdout.strip()
+
+
+COMMIT = (
+    "echo hi > f.txt && git add f.txt && git commit -q -m x && git log -1 --format='[main %h] x'"
+)
+
+
+async def test_a_commit_the_agent_made_is_linked_to_the_conversation(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "work"
+    git_repo(repo, remote="https://github.com/acme/widgets")
+    monkeypatch.chdir(repo)
+    fake = FakeGlen()
+    glen = make_glen(fake)
+
+    await committing_agent(repo, COMMIT, glen).run("commit it", conversation_id="conv-1")
+    await glen.flush()
+
+    [anchor] = fake.bodies("/api/mcp/route/commitAnchor")
+    assert anchor == {
+        "sha": head(repo),
+        "repoUrl": "https://github.com/acme/widgets",
+        "conversationId": "conv-1",
+        "branch": "main",
+    }
+    paths = [r.url.path for r in fake.requests]
+    assert paths.index("/api/mcp/route/turn") < paths.index("/api/mcp/route/commitAnchor")
+
+
+async def test_commands_that_do_not_commit_link_nothing(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "work"
+    git_repo(repo, remote="https://github.com/acme/widgets")
+    monkeypatch.chdir(repo)
+    for command in ("git status", "git commit --dry-run -m x", "echo '[main abc1234] x'"):
+        fake = FakeGlen()
+        glen = make_glen(fake)
+        await committing_agent(repo, command, glen).run("go")
+        await glen.flush()
+        assert fake.bodies("/api/mcp/route/commitAnchor") == [], command
+
+
+async def test_commit_linking_follows_the_mode_and_its_switch(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "work"
+    git_repo(repo, remote="https://github.com/acme/widgets")
+    monkeypatch.chdir(repo)
+    for kwargs in ({"mode": "silent"}, {"mode": "off"}, {"link": False}):
+        link = kwargs.pop("link", True)
+        fake = FakeGlen(**kwargs)
+        glen = make_glen(fake, link_commits=link)
+        await committing_agent(repo, COMMIT, glen).run("go")
+        await glen.flush()
+        assert fake.bodies("/api/mcp/route/commitAnchor") == [], kwargs
+        subprocess.run(["git", "-C", str(repo), "reset", "-q", "--hard", "HEAD~1"], check=False)
+
+
+async def test_a_commit_from_a_failed_run_is_still_linked(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "work"
+    git_repo(repo, remote="https://github.com/acme/widgets")
+    monkeypatch.chdir(repo)
+    fake = FakeGlen()
+    glen = make_glen(fake)
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(parts=[ToolCallPart("shell", {"command": COMMIT})])
+        raise RuntimeError("ran out of budget")
+
+    agent: Agent[None, str] = Agent(FunctionModel(respond), capabilities=[glen])
+
+    @agent.tool_plain
+    def shell(command: str) -> str:
+        done = subprocess.run(command, shell=True, cwd=repo, capture_output=True, text=True)
+        return done.stdout
+
+    with pytest.raises(RuntimeError):
+        await agent.run("go")
+    await glen.flush()
+
+    assert [a["sha"] for a in fake.bodies("/api/mcp/route/commitAnchor")] == [head(repo)]

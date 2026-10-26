@@ -22,6 +22,7 @@ from pydantic_ai.tools import AgentDepsT, ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 
 from pydantic_ai_glen import _control
+from pydantic_ai_glen._anchors import committed_shas, resolve_shas
 from pydantic_ai_glen._code_search import NotTraceable, blame_async
 from pydantic_ai_glen._control import Control
 from pydantic_ai_glen._git import detect_workspace
@@ -81,6 +82,11 @@ class Glen(AbstractCapability[AgentDepsT]):
     code_search: bool = True
     """Expose the `glen_code_search` tool when the agent runs in a git checkout with a remote:
     it traces lines of code to the conversations that wrote them. Needs `search`."""
+
+    link_commits: bool = True
+    """After a run that committed (a tool call ran `git commit` in this checkout), tell Glen which
+    commits belong to the conversation, as the Claude Code plugin does, so code search and the
+    PR reviewer can trace the code back to it. Only in `on` mode."""
 
     instructions: bool = True
     """Tell the agent to search Glen before changing a system the team already worked on.
@@ -365,18 +371,59 @@ class Glen(AbstractCapability[AgentDepsT]):
         if not self.record or not (await self.control()).records:
             return
         try:
-            body = self._turn_body(
-                conversation_id, run_id, messages, output, await self._workspace()
-            )
+            workspace = await self._workspace()
+            body = self._turn_body(conversation_id, run_id, messages, output, workspace)
         except Exception:
             log.exception("glen could not build the turn payload")
             return
+        delivery = self._deliver(body, workspace, messages)
         if self.background:
-            task = asyncio.create_task(self._send_turn(body))
+            task = asyncio.create_task(delivery)
             self._pending.add(task)
             task.add_done_callback(self._pending.discard)
         else:
-            await self._send_turn(body)
+            await delivery
+
+    async def _deliver(
+        self,
+        body: dict[str, Any],
+        workspace: dict[str, str] | None,
+        messages: list[ModelMessage],
+    ) -> None:
+        await self._send_turn(body)
+        try:
+            await self._link_commits(body["conversationId"], workspace, messages)
+        except Exception:
+            log.exception("glen could not link the run's commits")
+
+    async def _link_commits(
+        self,
+        conversation_id: str | None,
+        workspace: dict[str, str] | None,
+        messages: list[ModelMessage],
+    ) -> None:
+        if not (self.link_commits and conversation_id and workspace):
+            return
+        if not (workspace.get("cwd") and workspace.get("remoteUrl")):
+            return
+        if (await self.control()).mode != "on":
+            return
+        shas = committed_shas(messages)
+        for sha in await resolve_shas(workspace["cwd"], shas) if shas else []:
+            body: dict[str, Any] = {
+                "sha": sha,
+                "repoUrl": workspace["remoteUrl"],
+                "conversationId": conversation_id,
+            }
+            if workspace.get("branch"):
+                body["branch"] = workspace["branch"]
+            try:
+                r = await self._http().post("/api/mcp/route/commitAnchor", json=body, timeout=3.0)
+            except httpx.HTTPError as e:
+                log.warning("glen commit link failed: %s", e)
+                continue
+            if r.status_code != 200:
+                log.warning("glen commit link returned %s: %s", r.status_code, r.text[:300])
 
     async def _workspace(self) -> dict[str, str] | None:
         if self.workspace == "auto":
